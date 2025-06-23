@@ -9,6 +9,7 @@ import glob
 import random
 import pandas as pd
 import numpy as np
+from Bio.PDB import PDBParser
 
 class AAtutorial: # name modified
     """Class contains parameters for setting up free energy calculations
@@ -191,7 +192,7 @@ class AAtutorial: # name modified
         for e in printerr:
             print(e)              
 
-            
+    '''        
     def hybrid_structure_topology( self, edges=None, bVerbose=False ):
         print('----------------------------------')
         print('Creating hybrid structure/topology')
@@ -205,16 +206,104 @@ class AAtutorial: # name modified
             protpdb = '{0}'.format(self.pdbfile)
             #
             m = Model(protpdb, rename_atoms=True)
-            m2 = mutate(m=m, mut_resid=self.resids[i], mut_resname=self.edges[edge][1], ff=self.ff)
+
+            # fix: extract resid from edge string
+            resid = int(re.findall(r'\d+', edge)[0])
+            resname = self.edges[edge][1]
+
+            #m2 = mutate(m=m, mut_resid=self.resids[i], mut_resname=self.edges[edge][1], ff=self.ff)
+            # ✅ Use extracted values
+            m2 = mutate(m=m, mut_resid=resid, mut_resname=resname, ff=self.ff)
             m2.write('{0}/mutant.pdb'.format(outpath))
             gmx.pdb2gmx(f='{0}/mutant.pdb'.format(outpath), o='{0}/conf.pdb'.format(outpath), p='{0}/topol_prev.top'.format(outpath), ff=self.ff, water='tip3p', other_flags=' -i {0}/posre.itp'.format(outpath))
             topol = Topology('{0}/topol_prev.top'.format(outpath), ff=self.ff)
             pmxtop, _ = gen_hybrid_top(topol)
             pmxtop.write('{0}/topol.top'.format(outpath), scale_mass=0.33)
 
-        print('DONE')
-            
-            
+        print('DONE') '''
+
+
+    def hybrid_structure_topology(self, edges=None, bVerbose=False):
+        print('----------------------------------')
+        print('Creating hybrid structure/topology')
+        print('----------------------------------')
+
+        if edges is None:
+            edges = self.edges
+
+        # Step 0: Read original PDB (Bio.PDB) to map (chain, pdb_resnum) → PDB resname
+        from Bio.PDB import PDBParser
+        pdb_parser = PDBParser(QUIET=True)
+        struct = pdb_parser.get_structure("orig", self.original_pdbfile)
+        pdb_lookup = {}
+        for model in struct:
+            for chain in model:
+                for res in chain:
+                    if res.id[0] != ' ':
+                        continue
+                    pdb_lookup[(chain.id, res.id[1])] = res.get_resname().upper()
+
+        # Step 1: Load PMX model to run mutations and build map (chain, pmx_id) → pdb_resnum
+        pmx_model = Model(self.original_pdbfile, rename_atoms=True)
+        pmx_lookup = {}  # (chain, pmx_id) → original pdb_resnum
+        for res in pmx_model.residues:
+            if not res.atoms:
+                continue
+            pmx_lookup[(res.chain.id, res.id)] = res.atoms[0].resnr
+
+        # Step 2: Process each mutation
+        for i, edge in enumerate(edges):
+            # Parse mutation (string like "TRP118SER" or list)
+            if isinstance(edge, str):
+                import re
+                m = re.match(r'^([A-Z]{3})(\d+)([A-Z]{3})$', edge.upper())
+                if not m:
+                    raise ValueError(f"❌ Could not parse mutation: {edge}")
+                old3, pdb_str, new3 = m.groups()
+                pdb_resnum = int(pdb_str)
+            else:
+                old3, new3 = edge
+                pdb_resnum = pmx_lookup[(self.chains[i], self.resids[i])]  # fallback
+
+            chain_id = self.chains[i]
+            pmx_id = self.resids[i]
+            old3 = old3.upper()
+            new3 = new3.upper()
+
+            # Debug resolution
+            pdb_name = pdb_lookup.get((chain_id, pdb_resnum), '???')
+            print(f"\n➡️  Mutation request: {old3}{pdb_resnum}{new3}")
+            print(f"🔄 Maps to PMX: chain {chain_id}, PMX internal ID {pmx_id}, original PDB residue {pdb_name}{pdb_resnum}")
+
+            # Generate
+            outpath = self._get_specific_path(edge=edge)
+            model = Model(self.original_pdbfile, rename_atoms=True)
+            candidates = [r for r in model.residues
+                        if r.chain.id == chain_id and r.id == pmx_id]
+            if not candidates:
+                raise ValueError(f"❌ PMX residue ID {pmx_id} not found in chain {chain_id}")
+            target = candidates[0]
+
+            print(f"✅ Mutating {pdb_name}{pdb_resnum} (PMX ID {pmx_id}) → {new3}")
+            mutated = mutate(m=model, mut_resid=pmx_id, mut_resname=new3, ff=self.ff)
+            mutated.write(f'{outpath}/mutant.pdb')
+
+            gmx.pdb2gmx(
+                f=f'{outpath}/mutant.pdb',
+                o=f'{outpath}/conf.pdb',
+                p=f'{outpath}/topol_prev.top',
+                ff=self.ff,
+                water='tip3p',
+                other_flags='-ignh  -missing'  # force rebuilding hydrogens
+            )
+
+            topol = Topology(f'{outpath}/topol_prev.top', ff=self.ff)
+            pmxtop, _ = gen_hybrid_top(topol)
+            pmxtop.write(f'{outpath}/topol.top', scale_mass=0.33)
+
+        print('\n🎉 DONE')
+
+                
             
 
         
