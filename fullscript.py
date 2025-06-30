@@ -9,13 +9,26 @@ import re
 import subprocess
 import glob
 import random
-from AAtutorial import *
+from AAtutorial import AAtutorial
+from Bio.PDB import PDBParser
 
 from pmx.model import Model
 
 
 # === INITIALIZE FREE ENERGY ENVIRONMENT ===
 fe = AAtutorial()
+
+# Check if the instance has the method
+print("🔍 Does 'fe' have the method '_prepare_single_tpr'? ->", hasattr(fe, '_prepare_single_tpr'))
+
+# Print class and module info
+print("✅ Using class:", AAtutorial)
+print("📦 Defined in module:", AAtutorial.__module__)
+
+# Create another instance and check method existence again
+aat = AAtutorial()
+print("🔍 Does 'aat' have '_prepare_single_tpr'? ->", hasattr(aat, "_prepare_single_tpr"))
+
 
 # === CONFIGURATION ===
 fe.workPath = 'workpath'
@@ -166,6 +179,9 @@ fe.JOBpartition = 'p20,p24,p00,p32,p08,p16'
 
 # === STEP 9: Create EM jobscripts ===
 fe.prepare_jobscripts(simType='em')
+
+
+
 
 # === STEP 10: Prepare & Submit Equilibration ===
 fe.prepare_simulation(simType='eq')

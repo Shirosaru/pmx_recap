@@ -338,50 +338,86 @@ class AAtutorial: # name modified
             
             # ions protein
             if bIonProt:
-                inStr = '{0}/water.pdb'.format(outPath)
-                outStr = '{0}/ions.pdb'.format(outPath)
-                mdp = '{0}/em_l0.mdp'.format(self.mdpPath)
-                tpr = '{0}/tpr.tpr'.format(outPath)
-                top = '{0}/topol.top'.format(outPath)
-                mdout = '{0}/mdout.mdp'.format(outPath)
-                gmx.grompp(f=mdp, c=inStr, p=top, o=tpr, maxwarn=4, other_flags=' -po {0}'.format(mdout))
-                gmx.genion(s=tpr, p=top, o=outStr, conc=self.conc, neutral=True, 
-                      other_flags=' -pname {0} -nname {1}'.format(self.pname, self.nname))                
+                inStr = f'{outPath}/water.pdb'
+                outStr = f'{outPath}/ions.pdb'
+                mdp = f'{self.mdpPath}/em_l0.mdp'
+                tpr = f'{outPath}/tpr.tpr'
+                top = f'{outPath}/topol.top'
+                mdout = f'{outPath}/mdout.mdp'
+
+                print(f'🔧 Running grompp: {inStr} → {tpr}')
+                #gmx.grompp(f=mdp, c=inStr, p=top, o=tpr, maxwarn=4, other_flags=f'-po {mdout}')
+                gmx.grompp(
+                    f=mdp,
+                    c=inStr,
+                    p=top,
+                    o=tpr,
+                    other_flags=f'-po {mdout}'
+                )
+                
+                if not os.path.isfile(tpr):
+                    raise RuntimeError(f"❌ GROMPP failed — tpr file not created: {tpr}")
+
+                print(f'⚡ Running genion to create {outStr}')
+                gmx.genion(s=tpr, p=top, o=outStr, conc=self.conc, neutral=True,
+                        other_flags=f'-pname {self.pname} -nname {self.nname}')
+
+                if not os.path.isfile(outStr):
+                    raise RuntimeError(f"❌ genion failed — ions.pdb file not created at: {outStr}")                
                      
             # clean backed files
             self._clean_backup_files( outPath )
         print('DONE')
             
-    def _prepare_single_tpr( self, simpath, toppath, state, simType, empath=None, frameNum=0 ):
+    def _prepare_single_tpr(self, simpath, toppath, state, simType, empath=None, frameNum=0):
+        """
+        Prepare a single TPR file for the specified simulation type and state.
+        """
+        print('-----------------------------------------')
+        print(f'Preparing TPR for {simType} | State: {state} | Path: {simpath}')
+        print('-----------------------------------------')
+
+        mdp_prefix_map = {'em': 'em', 'eq': 'eq', 'transitions': 'ti'}
+        mdpPrefix = mdp_prefix_map.get(simType, '')
         
-        mdpPrefix = ''
-        if simType=='em':
-            mdpPrefix = 'em'
-        elif simType=='eq':
-            mdpPrefix = 'eq'
-        elif simType=='transitions':
-            mdpPrefix = 'ti'        
-            
-        top = '{0}/topol.top'.format(toppath)
-        tpr = '{0}/tpr.tpr'.format(simpath)
-        mdout = '{0}/mdout.mdp'.format(simpath)
-        # mdp
-        if state=='stateA':
-            mdp = '{0}/{1}_l0.mdp'.format(self.mdpPath,mdpPrefix)
-        else:
-            mdp = '{0}/{1}_l1.mdp'.format(self.mdpPath,mdpPrefix)
-        # str
-        if simType=='em':
-            inStr = '{0}/ions.pdb'.format(toppath)
-        elif simType=='eq':
-            inStr = '{0}/confout.gro'.format(empath)
-        elif simType=='transitions':
-            inStr = '{0}/frame{1}.gro'.format(simpath,frameNum)
-            tpr = '{0}/ti{1}.tpr'.format(simpath,frameNum)
-            
-        gmx.grompp(f=mdp, c=inStr, p=top, o=tpr, maxwarn=4, other_flags=' -po {0}'.format(mdout))
-        self._clean_backup_files( simpath )
-                    
+        top = os.path.join(toppath, 'topol.top')
+        tpr = os.path.join(simpath, 'tpr.tpr')
+        mdout = os.path.join(simpath, 'mdout.mdp')
+
+        # MDP file for state
+        mdp_file = os.path.join(self.mdpPath, f'{mdpPrefix}_l0.mdp' if state == 'stateA' else f'{mdpPrefix}_l1.mdp')
+
+        # Structure file selection
+        if simType == 'em':
+            in_str = os.path.join(toppath, 'ions.pdb')
+        elif simType == 'eq':
+            in_str = os.path.join(empath, 'confout.gro')
+        elif simType == 'transitions':
+            in_str = os.path.join(simpath, f'frame{frameNum}.gro')
+            tpr = os.path.join(simpath, f'ti{frameNum}.tpr')
+
+        # Log actual command being run
+        print("Running grompp:")
+        print(f"  MDP     : {mdp_file}")
+        print(f"  Input   : {in_str}")
+        print(f"  Topology: {top}")
+        print(f"  Output  : {tpr}")
+        print(f"  mdout   : {mdout}")
+        print(f"  maxwarn : 4\n")
+
+        # Run grompp with clean flag usage
+        gmx.grompp(
+            f=mdp_file,
+            c=in_str,
+            p=top,
+            o=tpr,
+            r=in_str,
+            po=mdout
+            #other_flags=f'-po {mdout}'
+        )
+
+        self._clean_backup_files(simpath)
+                        
          
     def prepare_simulation( self, edges=None, simType='em'):
         print('-----------------------------------------')
