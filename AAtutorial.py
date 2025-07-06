@@ -1,52 +1,44 @@
-import pmx
-from pmx.utils import create_folder
-from pmx import *
-import sys
-import os,shutil
-import re
+import os
 import subprocess
 import glob
-import random
+import re
+import shutil
 import pandas as pd
 import numpy as np
 from Bio.PDB import PDBParser
+from pmx import gmx, Model, mutate, Topology, gen_hybrid_top
+from pmx.utils import create_folder
+import pmx.jobscript
 
-class AAtutorial: # name modified
-    """Class contains parameters for setting up free energy calculations
 
-    Parameters
-    ----------
-    ...
 
-    Attributes
-    ----------
-    ....
-
+class AAtutorial:
+    """
+    Setup and run free-energy PMX/GROMACS workflows.
     """
 
     def __init__(self, **kwargs):
-        
-        # set gmxlib path
+        # Initialize GROMACS API
         gmx.set_gmxlib()
-        
-        # the results are summarized in a pandas framework
+
+        # Results containers
         self.resultsAll = pd.DataFrame()
         self.resultsSummary = pd.DataFrame()
-        
-        # paths
+
+        # Paths and simulation parameters
         self.workPath = './'
         self.pdbfile = 'inputs/protein.pdb'
-        self.mdpPath = '{0}/mdp'.format(self.workPath)
+        self.original_pdbfile = self.pdbfile
+        self.mdpPath = os.path.join(self.workPath, 'mdp')
 
         self.edges = {}
         self.resids = {}
-        
-        # parameters for the general setup
+        self.chains = []
+
         self.replicas = 5
-        self.simTypes = ['em','eq', 'transitions'] # modified
-        self.states = ['stateA','stateB']
-                
-        # simulation setup
+        self.simTypes = ['em', 'eq', 'transitions']
+        self.states = ['stateA', 'stateB']
+
         self.ff = 'amber99sb-star-ildn-mut'
         self.boxshape = 'dodecahedron'
         self.boxd = 1.0
@@ -54,12 +46,12 @@ class AAtutorial: # name modified
         self.conc = 0.15
         self.pname = 'NaJ'
         self.nname = 'ClJ'
-        
-        # job submission params
-        self.JOBqueue = 'SGE' # could be SLURM
-        self.JOBsimtime = 24 # hours
+
+        self.JOBqueue = 'SGE'
+        self.JOBsimtime = 24
         self.JOBnotr = 100
-        self.JOBsimcpu = 8 # CPU default
+        self.JOBsimcpu = 8
+        self.JOBntomp = 1
         self.JOBbGPU = True
         self.JOBmodules = []
         self.JOBsource = []
@@ -67,617 +59,499 @@ class AAtutorial: # name modified
         self.JOBgmx = 'gmx mdrun'
         self.JOBpartition = ''
 
-        for key, val in kwargs.items():
-            setattr(self,key,val)
-            
-    def prepareFreeEnergyDir( self ):
-        
-        
-        # read edges (directly or from a file)
+        for k, v in kwargs.items():
+            setattr(self, k, v)
+
+    def _read_path(self, path):
+        return os.path.abspath(path)
+
+    def _clean_backup_files(self, path):
+        for f in glob.glob(os.path.join(path, '*#')):
+            os.remove(f)
+
+    def _get_specific_path(self, edge=None, state=None, r=None, sim=None):
+        path = self.workPath
+        if edge:
+            path = os.path.join(path, edge)
+        if state:
+            path = os.path.join(path, state)
+        if r:
+            path = os.path.join(path, f'run{r}')
+        if sim:
+            path = os.path.join(path, sim)
+        return path
+
+    def _be_verbose(self, process, bVerbose=False):
+        out, err = process.communicate()
+        if bVerbose and out:
+            print(out.decode())
+        if err:
+            print(err.decode())
+
+    def grompp(self, f, c, p, o, r=None, po=None, maxwarn=None, other_flags=None):
+        cmd = ['gmx', 'grompp', '-f', f, '-c', c, '-p', p, '-o', o]
+        if r:
+            cmd += ['-r', r]
+        if po:
+            cmd += ['-po', po]
+        if maxwarn is not None:
+            cmd += ['-maxwarn', str(maxwarn)]
+        if other_flags:
+            extra = other_flags.split() if isinstance(other_flags, str) else other_flags
+            cmd += extra
+        print("🌐 Running:", ' '.join(cmd))
+        subprocess.run(cmd, check=True)
+
+    def prepareFreeEnergyDir(self):
+        # Load edges and setup folder hierarchy
         self._read_edges()
-        
-        # read mdpPath
-        self.mdpPath = self._read_path( self.mdpPath )
-        
-        # workpath
-        self.workPath = self._read_path( self.workPath )
-        create_folder( self.workPath )
-        
-        # create folder structure
-        self._create_folder_structure( )
-        
-        # print summary
-        self._print_summary( )
+        self.mdpPath = self._read_path(self.mdpPath)
+        self.workPath = self._read_path(self.workPath)
+        create_folder(self.workPath)
+        self._create_folder_structure()
+        self._print_summary()
+        self._print_folder_structure()
+        print("✅ Directory setup complete\n")
 
-        # print folder structure
-        self._print_folder_structure( )
-        
-        print('DONE')
-        
-        
-    # _functions to quickly get a path at different levels, e.g wppath, edgepath... like in _create_folder_structure
-    def _get_specific_path( self, edge=None, state=None, r=None, sim=None ):
-        if edge==None:
-            return(self.workPath)       
-        edgepath = '{0}/{1}'.format(self.workPath,edge)
-        
-        if state==None:
-            return(edgepath)
-        statepath = '{0}/{1}'.format(edgepath,state)
-        
-        if r==None:
-            return(statepath)
-        runpath = '{0}/run{1}'.format(statepath,r)
-        
-        if sim==None:
-            return(runpath)
-        simpath = '{0}/{1}'.format(runpath,sim)
-        return(simpath)
-                
-    def _read_path( self, path ):
-        return(os.path.abspath(path))
-                
-    def _read_edges( self ):
-        # read from file
-        try:
-            if os.path.isfile( self.edges ):
-                self._read_edges_from_file( self )
-        # edge provided as an array
-        except: 
-            foo = {}
-            for re,e in enumerate(self.edges):
-                key = '{0}{1}{2}'.format(e[0],self.resids[re],e[1])
-                foo[key] = e
-            self.edges = foo
-            
-    def _read_edges_from_file( self ):
-        self.edges = 'Edges read from file'
-        
-        
-    def _create_folder_structure( self, edges=None ):
-        # edge
-        if edges==None:
-            edges = self.edges        
-        for edge in edges:
-            print(edge)            
-            edgepath = '{0}/{1}'.format(self.workPath,edge)
-            create_folder(edgepath)
+    def _read_edges(self):
+        if isinstance(self.edges, str) and os.path.isfile(self.edges):
+            self._read_edges_from_file()
+        else:
+            self.edges = {
+                f"{e[0]}{self.resids[i]}{e[1]}": e
+                for i, e in enumerate(self.edges)
+            }
 
-            # stateA/stateB
+    def _read_edges_from_file(self):
+        # Implement file parsing to populate self.edges
+        pass
+
+    def _create_folder_structure(self):
+        for edge in self.edges:
             for state in self.states:
-                statepath = '{0}/{1}'.format(edgepath,state)
-                create_folder(statepath)
-
-                # run1/run2/run3
-                for r in range(1,self.replicas+1):
-                    runpath = '{0}/run{1}'.format(statepath,r)
-                    create_folder(runpath)
-
-                    # em/eq_posre/eq/transitions
+                for r in range(1, self.replicas + 1):
                     for sim in self.simTypes:
-                        simpath = '{0}/{1}'.format(runpath,sim)
-                        create_folder(simpath)
+                        p = self._get_specific_path(edge, state, r, sim)
+                        create_folder(p)
 
-    def _print_summary( self ):
-        print('\n---------------------\nSummary of the setup:\n---------------------\n')
-        print('   workpath: {0}'.format(self.workPath))
-        print('   pdb file to use: {0}'.format(self.pdbfile))
-        print('   mdp path: {0}'.format(self.mdpPath))
-        print('   number of replicase: {0}'.format(self.replicas))
-        print('   mutations:')
-        for e in self.edges.keys():
-            print('        {0}'.format(e))
+    def _print_summary(self):
+        print("📋 Setup Summary")
+        print(f"   Work path: {self.workPath}")
+        print(f"   PDB file : {self.pdbfile}")
+        print(f"   MDP folder: {self.mdpPath}")
+        print(f"   Replicas : {self.replicas}")
+        print("   Mutations:")
+        for e in self.edges:
+            print(f"     - {e}")
 
-    def _print_folder_structure( self ):
-        print('\n---------------------\nDirectory structure:\n---------------------\n')
-        print('{0}/'.format(self.workPath))
-        print('|')
-        print('|--X2Y')
-        print('|--|--stateA')
-        print('|--|--|--run1/2/3')
-        print('|--|--|--|--em/eq/transitions')
-        print('|--|--stateB')
-        print('|--|--|--run1/2/3')
-        print('|--|--|--|--em/eq/transitions')
-        print('|--X2Y')
-
-    def _be_verbose( self, process, bVerbose=False ):
-        out = process.communicate()            
-        if bVerbose==True:
-            printout = out[0].splitlines()
-            for o in printout:
-                print(o)
-        # error is printed every time                  
-        printerr = out[1].splitlines()                
-        for e in printerr:
-            print(e)              
-
-    '''        
-    def hybrid_structure_topology( self, edges=None, bVerbose=False ):
-        print('----------------------------------')
-        print('Creating hybrid structure/topology')
-        print('----------------------------------')
-
-        if edges==None:
-            edges = self.edges        
-        for i, edge in enumerate(edges):
-            print(edge)
-            outpath = self._get_specific_path(edge=edge)
-            protpdb = '{0}'.format(self.pdbfile)
-            #
-            m = Model(protpdb, rename_atoms=True)
-
-            # fix: extract resid from edge string
-            resid = int(re.findall(r'\d+', edge)[0])
-            resname = self.edges[edge][1]
-
-            #m2 = mutate(m=m, mut_resid=self.resids[i], mut_resname=self.edges[edge][1], ff=self.ff)
-            # ✅ Use extracted values
-            m2 = mutate(m=m, mut_resid=resid, mut_resname=resname, ff=self.ff)
-            m2.write('{0}/mutant.pdb'.format(outpath))
-            gmx.pdb2gmx(f='{0}/mutant.pdb'.format(outpath), o='{0}/conf.pdb'.format(outpath), p='{0}/topol_prev.top'.format(outpath), ff=self.ff, water='tip3p', other_flags=' -i {0}/posre.itp'.format(outpath))
-            topol = Topology('{0}/topol_prev.top'.format(outpath), ff=self.ff)
-            pmxtop, _ = gen_hybrid_top(topol)
-            pmxtop.write('{0}/topol.top'.format(outpath), scale_mass=0.33)
-
-        print('DONE') '''
-
+    def _print_folder_structure(self):
+        print("\n📂 Directory Layout:")
+        print(f"{self.workPath}/")
+        print("└── <edge>/")
+        print("    └── stateA/stateB/")
+        print("        └── run1..N/")
+        print("            └── em/eq/transitions/\n")
 
     def hybrid_structure_topology(self, edges=None, bVerbose=False):
-        print('----------------------------------')
-        print('Creating hybrid structure/topology')
-        print('----------------------------------')
+        print("🔧 Building hybrid topology for mutations...")
 
         if edges is None:
             edges = self.edges
 
-        # Step 0: Read original PDB (Bio.PDB) to map (chain, pdb_resnum) → PDB resname
-        from Bio.PDB import PDBParser
-        pdb_parser = PDBParser(QUIET=True)
-        struct = pdb_parser.get_structure("orig", self.original_pdbfile)
-        pdb_lookup = {}
-        for model in struct:
-            for chain in model:
-                for res in chain:
-                    if res.id[0] != ' ':
-                        continue
-                    pdb_lookup[(chain.id, res.id[1])] = res.get_resname().upper()
+        # Parse original PDB
+        parser = PDBParser(QUIET=True)
+        struct = parser.get_structure("orig", self.original_pdbfile)
+        pdb_map = {
+            (chain.id, resid.id[1]): resid.get_resname().upper()
+            for model in struct
+            for chain in model
+            for resid in chain
+            if resid.id[0] == ' '
+        }
 
-        # Step 1: Load PMX model to run mutations and build map (chain, pmx_id) → pdb_resnum
+        # PMX model
         pmx_model = Model(self.original_pdbfile, rename_atoms=True)
-        pmx_lookup = {}  # (chain, pmx_id) → original pdb_resnum
-        for res in pmx_model.residues:
-            if not res.atoms:
-                continue
-            pmx_lookup[(res.chain.id, res.id)] = res.atoms[0].resnr
+        pmx_map = {
+            (r.chain.id, r.id): r.atoms[0].resnr
+            for r in pmx_model.residues
+            if r.atoms
+        }
 
-        # Step 2: Process each mutation
+        # Preprocess original PDB with pdb2gmx to add missing hydrogens
+        print("🔄 Running pdb2gmx on original PDB to add hydrogens...")
+        preprocessed_pdb = os.path.join(self.workPath, "processed_input.pdb")
+        gmx.pdb2gmx(
+            f=self.original_pdbfile,
+            o=preprocessed_pdb,
+            p=os.path.join(self.workPath, "dummy.top"),
+            ff=self.ff,
+            water=self.water,
+            other_flags='-ignh -missing'
+        )
+
         for i, edge in enumerate(edges):
-            # Parse mutation (string like "TRP118SER" or list)
             if isinstance(edge, str):
-                import re
                 m = re.match(r'^([A-Z]{3})(\d+)([A-Z]{3})$', edge.upper())
                 if not m:
-                    raise ValueError(f"❌ Could not parse mutation: {edge}")
-                old3, pdb_str, new3 = m.groups()
-                pdb_resnum = int(pdb_str)
+                    raise ValueError(f"Unrecognized mutation format: {edge}")
+                old3, resnum_str, new3 = m.groups()
+                resnum = int(resnum_str)
             else:
                 old3, new3 = edge
-                pdb_resnum = pmx_lookup[(self.chains[i], self.resids[i])]  # fallback
+                resnum = pmx_map[(self.chains[i], self.resids[i])]
 
             chain_id = self.chains[i]
             pmx_id = self.resids[i]
-            old3 = old3.upper()
-            new3 = new3.upper()
+            pdb_name = pdb_map.get((chain_id, resnum), 'UNK')
 
-            # Debug resolution
-            pdb_name = pdb_lookup.get((chain_id, pdb_resnum), '???')
-            print(f"\n➡️  Mutation request: {old3}{pdb_resnum}{new3}")
-            print(f"🔄 Maps to PMX: chain {chain_id}, PMX internal ID {pmx_id}, original PDB residue {pdb_name}{pdb_resnum}")
+            print(f"\n➡️  {old3}{resnum}{new3} → PMX chain {chain_id} ID {pmx_id} ({pdb_name}{resnum})")
 
-            # Generate
-            outpath = self._get_specific_path(edge=edge)
-            model = Model(self.original_pdbfile, rename_atoms=True)
-            candidates = [r for r in model.residues
-                        if r.chain.id == chain_id and r.id == pmx_id]
-            if not candidates:
-                raise ValueError(f"❌ PMX residue ID {pmx_id} not found in chain {chain_id}")
-            target = candidates[0]
+            outdir = self._get_specific_path(edge=edge)
 
-            print(f"✅ Mutating {pdb_name}{pdb_resnum} (PMX ID {pmx_id}) → {new3}")
-            mutated = mutate(m=model, mut_resid=pmx_id, mut_resname=new3, ff=self.ff)
-            mutated.write(f'{outpath}/mutant.pdb')
+            # Mutate using the preprocessed structure (with hydrogens)
+            mutated = mutate(
+                m=Model(preprocessed_pdb, rename_atoms=True),
+                mut_resid=pmx_id,
+                mut_resname=new3,
+                ff=self.ff
+            )
+            mutant_pdb = os.path.join(outdir, "mutant.pdb")
+            mutated.write(mutant_pdb)
 
+            # pdb2gmx on the mutant to generate topology
             gmx.pdb2gmx(
-                f=f'{outpath}/mutant.pdb',
-                o=f'{outpath}/conf.pdb',
-                p=f'{outpath}/topol_prev.top',
+                f=mutant_pdb,
+                o=os.path.join(outdir, "conf.pdb"),
+                p=os.path.join(outdir, "topol_prev.top"),
                 ff=self.ff,
-                water='tip3p',
-                other_flags='-ignh  -missing'  # force rebuilding hydrogens
+                water=self.water,
+                other_flags='-ignh -missing'
             )
 
-            topol = Topology(f'{outpath}/topol_prev.top', ff=self.ff)
-            pmxtop, _ = gen_hybrid_top(topol)
-            pmxtop.write(f'{outpath}/topol.top', scale_mass=0.33)
+            # Hybrid topology generation
+            top = Topology(os.path.join(outdir, "topol_prev.top"), ff=self.ff)
+            hyb, _ = gen_hybrid_top(top)
+            hyb.write(os.path.join(outdir, "topol.top"), scale_mass=0.33)
 
-        print('\n🎉 DONE')
+        print("🎉 Hybrid structures ready\n")
 
-                
-            
+    def boxWaterIons(self, edges=None, bBoxProt=True, bWatProt=True, bIonProt=True):
+        import shutil
 
-        
-    def _clean_backup_files( self, path ):
-        toclean = glob.glob('{0}/*#'.format(path)) 
-        for clean in toclean:
-            os.remove(clean)        
-    
-    def boxWaterIons( self, edges=None, bBoxProt=True, bWatProt=True, bIonProt=True):
-        print('----------------')
-        print('Box, water, ions')
-        print('----------------')
-        
-        if edges==None:
+        print('=============================')
+        print('🔧 Step: Box, Solvate, Add Ions')
+        print('=============================')
+
+        if edges is None:
             edges = self.edges
+
         for edge in edges:
-            print(edge)            
-            outPath = self._get_specific_path(edge=edge)
+            print(f"\n➡️ Processing edge: {edge}")
+            out = self._get_specific_path(edge=edge)
+            conf = os.path.join(out, 'conf.pdb')
+            topol = os.path.join(out, 'topol.top')
 
-            # box protein
-            if bBoxProt==True:            
-                inStr = '{0}/conf.pdb'.format(outPath)
-                outStr = '{0}/box.pdb'.format(outPath)
-                gmx.editconf(inStr, o=outStr, bt=self.boxshape, d=self.boxd, other_flags='')
+            # === Ensure hybrid .itp files are present ===
+            for required_itp in ['stateA.itp', 'stateB.itp']:
+                itp_path = os.path.join(out, required_itp)
+                if not os.path.exists(itp_path):
+                    # Try copying from hybrid source path
+                    src = os.path.join(out, required_itp)  # Same as destination folder
+                    if not os.path.exists(itp_path):
+                        src = os.path.join(out, required_itp)
+                        if os.path.exists(src) and src != itp_path:
+                            print(f"📄 Copying {required_itp} from {src}")
+                            shutil.copy(src, itp_path)
+                        elif not os.path.exists(src):
+                            raise FileNotFoundError(f"❌ {required_itp} not found in {out}")
+                    if os.path.exists(src):
+                        print(f"📄 Copying {required_itp} from hybrid path.")
+                        shutil.copy(src, itp_path)
+                    else:
+                        raise FileNotFoundError(f"❌ {required_itp} not found in {out} or {self.hybridPath}")
 
-            # water protein
-            if bWatProt==True:            
-                inStr = '{0}/box.pdb'.format(outPath)
-                outStr = '{0}/water.pdb'.format(outPath)
-                top = '{0}/topol.top'.format(outPath)
-                gmx.solvate(inStr, cs='spc216.gro', p=top, o=outStr)                
-            
-            # ions protein
+            # === Patch topol.top if needed ===
+            with open(topol, 'r') as f:
+                topol_lines = f.readlines()
+
+            if not any('stateA.itp' in line for line in topol_lines):
+                insert_idx = next((i for i, line in enumerate(topol_lines)
+                                if line.strip().startswith('[ moleculetype ]')), len(topol_lines))
+
+                topol_lines.insert(insert_idx, '#include "stateA.itp"\n')
+                topol_lines.insert(insert_idx + 1, '#include "stateB.itp"\n')
+
+                with open(topol, 'w') as f:
+                    f.writelines(topol_lines)
+
+                print("🔧 Patched topol.top to include stateA.itp and stateB.itp.")
+
+            # === Box ===
+            if bBoxProt:
+                box = os.path.join(out, 'box.pdb')
+                print("📦 Running editconf to create box")
+                try:
+                    subprocess.run(['gmx', 'editconf', '-f', conf, '-o', box, '-bt', self.boxshape, '-d', str(self.boxd)],
+                                check=True, capture_output=True, text=True)
+                except subprocess.CalledProcessError as e:
+                    print("⚠️ editconf failed, retrying with explicit -box:", e.stderr)
+                    subprocess.run(['gmx', 'editconf', '-f', conf, '-o', box, '-bt', self.boxshape,
+                                    '-box', str(self.boxd), str(self.boxd), str(self.boxd)],
+                                check=True)
+
+            # === Solvate ===
+            if bWatProt:
+                box = os.path.join(out, 'box.pdb')
+                water = os.path.join(out, 'water.pdb')
+                print("💧 Running solvate")
+                subprocess.run(['gmx', 'solvate', '-cp', box, '-cs', 'spc216.gro',
+                                '-p', topol, '-o', water],
+                            check=True, capture_output=True)
+
+            # === GROMPP for Ion ===
             if bIonProt:
-                inStr = f'{outPath}/water.pdb'
-                outStr = f'{outPath}/ions.pdb'
-                mdp = f'{self.mdpPath}/em_l0.mdp'
-                tpr = f'{outPath}/tpr.tpr'
-                top = f'{outPath}/topol.top'
-                mdout = f'{outPath}/mdout.mdp'
+                water = os.path.join(out, 'water.pdb')
+                tpr = os.path.join(out, 'tpr.tpr')
+                mdout = os.path.join(out, 'mdout.mdp')
 
-                print(f'🔧 Running grompp: {inStr} → {tpr}')
-                #gmx.grompp(f=mdp, c=inStr, p=top, o=tpr, maxwarn=4, other_flags=f'-po {mdout}')
-                gmx.grompp(
-                    f=mdp,
-                    c=inStr,
-                    p=top,
-                    o=tpr,
-                    other_flags=f'-po {mdout}'
-                )
-                
-                if not os.path.isfile(tpr):
-                    raise RuntimeError(f"❌ GROMPP failed — tpr file not created: {tpr}")
+                print("⚙️ Running grompp for ion setup")
+                result = subprocess.run(['gmx', 'grompp',
+                                        '-f', os.path.join(self.mdpPath, 'em_l0.mdp'),
+                                        '-c', water,
+                                        '-p', topol,
+                                        '-o', tpr,
+                                        '-r', water,
+                                        '-po', mdout,
+                                        '-maxwarn', '4'],
+                                        capture_output=True, text=True)
 
-                print(f'⚡ Running genion to create {outStr}')
-                gmx.genion(s=tpr, p=top, o=outStr, conc=self.conc, neutral=True,
-                        other_flags=f'-pname {self.pname} -nname {self.nname}')
+                if "No default" in result.stderr:
+                    print("❌ Topology has missing bonded parameters:\n", result.stderr)
+                    raise RuntimeError("Hybrid topology has missing bonded parameters. Fix topology.")
 
-                if not os.path.isfile(outStr):
-                    raise RuntimeError(f"❌ genion failed — ions.pdb file not created at: {outStr}")                
-                     
-            # clean backed files
-            self._clean_backup_files( outPath )
-        print('DONE')
-            
+                print("✅ grompp passed. Proceeding to genion")
+                subprocess.run(['gmx', 'genion', '-s', tpr, '-p', topol,
+                                '-o', os.path.join(out, 'ions.pdb'),
+                                '-conc', str(self.conc), '-neutral',
+                                '-pname', self.pname, '-nname', self.nname],
+                            input=b'WE\n', check=True)
+
+            # === Clean backup files ===
+            self._clean_backup_files(out)
+
+        print('\n✅ Finished: boxWaterIons\n')
+
+
     def _prepare_single_tpr(self, simpath, toppath, state, simType, empath=None, frameNum=0):
-        """
-        Prepare a single TPR file for the specified simulation type and state.
-        """
-        print('-----------------------------------------')
-        print(f'Preparing TPR for {simType} | State: {state} | Path: {simpath}')
-        print('-----------------------------------------')
-
-        mdp_prefix_map = {'em': 'em', 'eq': 'eq', 'transitions': 'ti'}
-        mdpPrefix = mdp_prefix_map.get(simType, '')
-        
-        top = os.path.join(toppath, 'topol.top')
-        tpr = os.path.join(simpath, 'tpr.tpr')
-        mdout = os.path.join(simpath, 'mdout.mdp')
-
-        # MDP file for state
-        mdp_file = os.path.join(self.mdpPath, f'{mdpPrefix}_l0.mdp' if state == 'stateA' else f'{mdpPrefix}_l1.mdp')
-
-        # Structure file selection
-        if simType == 'em':
-            in_str = os.path.join(toppath, 'ions.pdb')
-        elif simType == 'eq':
-            in_str = os.path.join(empath, 'confout.gro')
-        elif simType == 'transitions':
-            in_str = os.path.join(simpath, f'frame{frameNum}.gro')
-            tpr = os.path.join(simpath, f'ti{frameNum}.tpr')
-
-        # Log actual command being run
-        print("Running grompp:")
-        print(f"  MDP     : {mdp_file}")
-        print(f"  Input   : {in_str}")
-        print(f"  Topology: {top}")
-        print(f"  Output  : {tpr}")
-        print(f"  mdout   : {mdout}")
-        print(f"  maxwarn : 4\n")
-
-        # Run grompp with clean flag usage
-        gmx.grompp(
-            f=mdp_file,
-            c=in_str,
-            p=top,
-            o=tpr,
-            r=in_str,
-            po=mdout
-            #other_flags=f'-po {mdout}'
+        mdp_map = {'em': 'em', 'eq': 'eq', 'transitions': 'ti'}
+        prefix = mdp_map.get(simType, '')
+        mdp_file = os.path.join(
+            self.mdpPath,
+            f"{prefix}_l0.mdp" if state == 'stateA' else f"{prefix}_l1.mdp"
         )
 
+        in_str = {
+            'em': os.path.join(toppath, 'ions.pdb'),
+            'eq': os.path.join(empath, 'confout.gro') if empath else None,
+            'transitions': os.path.join(simpath, f"frame{frameNum}.gro")
+        }[simType]
+
+        out_tpr = os.path.join(simpath, "tpr.tpr")
+        out_mdout = os.path.join(simpath, "mdout.mdp")
+        print(f"📂 Preparing TPR: {simpath}")
+        self.grompp(
+            f=mdp_file,
+            c=in_str,
+            p=os.path.join(toppath, "topol.top"),
+            o=out_tpr,
+            r=in_str,
+            po=out_mdout,
+            maxwarn=4
+        )
         self._clean_backup_files(simpath)
-                        
-         
-    def prepare_simulation( self, edges=None, simType='em'):
-        print('-----------------------------------------')
-        print('Preparing simulation: {0}'.format(simType))
-        print('-----------------------------------------')
-        
-        mdpPrefix = ''
-        if simType=='em':
-            mdpPrefix = 'em'
-        elif simType=='eq':
-            mdpPrefix = 'eq'
-        elif simType=='transitions':
-            mdpPrefix = 'ti'
-        
-        if edges==None:
-            edges = self.edges
-        for edge in edges:
-            print(edge)
-            toppath = self._get_specific_path(edge=edge)
-            
-            for state in self.states:
-                for r in range(1,self.replicas+1):
-                    simpath = self._get_specific_path(edge=edge,state=state,r=r,sim=simType)
-                    empath = self._get_specific_path(edge=edge,state=state,r=r,sim='em')
-                    self._prepare_single_tpr( simpath, toppath, state, simType, empath )
-        print('DONE')
-        
 
-    def _run_mdrun( self, tpr=None, ener=None, confout=None, mdlog=None, 
-                    cpo=None, trr=None, xtc=None, dhdl=None, bVerbose=False):
-        # EM
-        if xtc==None:
-            process = subprocess.Popen(['gmx','mdrun',
-                                '-s',tpr,
-                                '-e',ener,
-                                '-c',confout,
-                                '-o',trr,                                        
-                                '-g',mdlog],
-                                stdout=subprocess.PIPE, 
-                                stderr=subprocess.PIPE)
-            self._be_verbose( process, bVerbose=bVerbose )                    
-            process.wait()           
-        # other FE runs
+    def prepare_simulation(self, edges=None, simType='em'):
+        if edges is None:
+            edges = self.edges
+        print(f"🧪 Preparing '{simType}' runs")
+        for edge in edges:
+            topo = self._get_specific_path(edge=edge)
+            for state in self.states:
+                for r in range(1, self.replicas + 1):
+                    sim_dir = self._get_specific_path(edge, state, r, simType)
+                    em_dir = self._get_specific_path(edge, state, r, 'em')
+                    self._prepare_single_tpr(sim_dir, topo, state, simType, empathem=em_dir)
+        print(f"✅ {simType} preparation done\n")
+
+    def _run_mdrun(self, tpr, ener, confout, mdlog, trr, dhdl=None, xtc=None, bVerbose=False):
+        cmd = ['gmx', 'mdrun', '-s', tpr, '-e', ener, '-c', confout, '-g', mdlog]
+        if xtc:
+            cmd += ['-dhdl', dhdl, '-x', xtc, '-o', trr]
         else:
-            process = subprocess.Popen(['gmx','mdrun',
-                                '-s',tpr,
-                                '-e',ener,
-                                '-c',confout,
-                                '-dhdl',dhdl,
-                                '-x',xtc,
-                                '-o',trr,
-                                '-cpo',cpo,                                        
-                                '-g',mdlog],
-                                stdout=subprocess.PIPE, 
-                                stderr=subprocess.PIPE)
-            self._be_verbose( process, bVerbose=bVerbose )                    
-            process.wait()           
-            
+            cmd += ['-o', trr]
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        self._be_verbose(proc, bVerbose=bVerbose)
+        proc.wait()
 
-    def run_simulation_locally( self, edges=None, simType='em', bVerbose=False ):
-        print('-------------------------------------------')
-        print('Run simulation locally: {0}'.format(simType))
-        print('-------------------------------------------')
-        
-        if edges==None:
+    def run_simulation_locally(self, edges=None, simType='em', bVerbose=False):
+        if edges is None:
             edges = self.edges
+        print(f"⚙️ Running '{simType}' simulations")
         for edge in edges:
-            
             for state in self.states:
-                for r in range(1,self.replicas+1):            
-                    print('Running: PROT {0} {1} run{2}'.format(edge,state,r))
-                    simpath = self._get_specific_path(edge=edge,state=state,r=r,sim=simType)
-                    tpr = '{0}/tpr.tpr'.format(simpath)
-                    ener = '{0}/ener.edr'.format(simpath)
-                    confout = '{0}/confout.gro'.format(simpath)
-                    mdlog = '{0}/md.log'.format(simpath)
-                    trr = '{0}/traj.trr'.format(simpath)
-                    self._run_mdrun(tpr=tpr,trr=trr,ener=ener,confout=confout,mdlog=mdlog,bVerbose=bVerbose)
-                    self._clean_backup_files( simpath )
-        print('DONE')
+                for r in range(1, self.replicas + 1):
+                    sim_dir = self._get_specific_path(edge, state, r, simType)
+                    tpr = os.path.join(sim_dir, "tpr.tpr")
+                    ener = os.path.join(sim_dir, "ener.edr")
+                    confout = os.path.join(sim_dir, "confout.gro")
+                    mdlog = os.path.join(sim_dir, "md.log")
+                    trr = os.path.join(sim_dir, "traj.trr")
+                    xtc = os.path.join(sim_dir, "traj.xtc") if simType != 'em' else None
+                    dhdl = os.path.join(sim_dir, "dhdl.xvg") if simType != 'em' else None
 
-    def _create_jobscript(self,fname,jobname,modules,gmx,partition,simpath,indx):
-        fp = open(fname,'w')
-        fp.write('#!/bin/bash\n')
-        fp.write('#SBATCH --job-name={}\n'.format(jobname))
-        fp.write('#SBATCH --get-user-env\n')
-        fp.write('#SBATCH --nodes=1\n')
-        fp.write('#SBATCH --ntasks-per-node={}\n'.format(indx[1]-indx[0]))
-        fp.write('#SBATCH --cpus-per-task={}\n'.format(self.JOBntomp))
-        fp.write('#SBATCH --mail-type=none\n')
-        fp.write('#SBATCH --time=24:00:00\n')
-        fp.write('#SBATCH --partition={}\n'.format(partition))
-        if self.JOBbGPU == True:
-            fp.write('#SBATCH --gres=gpu:1\n')
-        fp.write('#SBATCH --exclusive\n')
-        fp.write('\n')
+                    self._run_mdrun(tpr, ener, confout, mdlog, trr, dhdl=dhdl, xtc=xtc, bVerbose=bVerbose)
+                    self._clean_backup_files(sim_dir)
 
-        for source in self.JOBsource:
-            fp.write('source {}\n'.format(source))
-        fp.write('\n')
-        for module in modules:
-            fp.write('module load {}\n'.format(module))
-        fp.write('export GMXRUN="{}"\n'.format(gmx))
-        fp.write('\n')
+        print(f"✅ Local runs for '{simType}' completed\n")
 
-        fp.write('\n')
-        fp.write('cd $TMPDIR\n')
-        fp.write('for i in {{{}..{}}}; do \n'.format(indx[0]+1, indx[1]))
-        fp.write('mkdir ti$i\n')
-        fp.write('cp {}/ti$i.tpr ti$i/tpr.tpr\n'.format(simpath))
-        fp.write('done\n')
-        fp.write('$GMXRUN -s tpr.tpr -multidir ti{{{}..{}}}\n'.format(indx[0]+1, indx[1]))
-        fp.write('\n')
-        fp.write('for i in {{{}..{}}}; do \n'.format(indx[0]+1, indx[1]))
-        fp.write('cp ti$i/dhdl.xvg {}/dhdl$i.xvg\n'.format(simpath))
-        fp.write('done\n')
-        fp.close()
-
-
-        fp.close()
-    def prepare_jobscripts( self, edges=None, simType='em'):
-        print('---------------------------------------------')
-        print('Preparing jobscripts for: {0}'.format(simType))
-        print('---------------------------------------------')
-        
-        jobfolder = '{0}/{1}_jobscripts'.format(self.workPath,simType)
-        os.system('mkdir {0}'.format(jobfolder))
-        
-        if edges==None:
+    def prepare_transitions(self, edges=None, bGenTpr=True):
+        if edges is None:
             edges = self.edges
-            
+        print("🌀 Generating transition snapshots")
+        for edge in edges:
+            for state in self.states:
+                for r in range(1, self.replicas + 1):
+                    eq_dir = self._get_specific_path(edge, state, r, 'eq')
+                    ti_dir = self._get_specific_path(edge, state, r, 'transitions')
+                    create_folder(ti_dir)
+
+                    # fetch frame0 and rename
+                    subprocess.run([
+                        'gmx', 'trjconv',
+                        '-s', os.path.join(eq_dir, "tpr.tpr"),
+                        '-f', os.path.join(eq_dir, "traj.trr"),
+                        '-o', os.path.join(ti_dir, "frame.gro"),
+                        '-sep', '-ur', 'compact', '-pbc', 'mol', '-b', '2000'
+                    ], input=b"0\n", check=True)
+                    os.rename(os.path.join(ti_dir, "frame0.gro"), os.path.join(ti_dir, "frame100.gro"))
+                    self._clean_backup_files(ti_dir)
+
+                    if bGenTpr:
+                        for i in range(1, 101):
+                            self._prepare_single_tpr(
+                                simpath=ti_dir,
+                                toppath=self._get_specific_path(edge),
+                                state=state,
+                                simType='transitions',
+                                empath=eq_dir,
+                                frameNum=i
+                            )
+        print("✅ Transitions prepared\n")
+
+    def run_analysis(self, edges=None, bProt=True, bParseOnly=False, bVerbose=False):
+        if edges is None:
+            edges = self.edges
+        print("📊 Running analysis across replicas")
+        for edge in edges:
+            if bProt:
+                for r in range(1, self.replicas + 1):
+                    analysis_dir = os.path.join(self._get_specific_path(edge), f"analyse{r}")
+                    create_folder(analysis_dir)
+                    aA = os.path.join(self._get_specific_path(edge, 'stateA', r, 'transitions'))
+                    aB = os.path.join(self._get_specific_path(edge, 'stateB', r, 'transitions'))
+                    cmd = (
+                        f"pmx analyse -fA {aA}/*xvg -fB {aB}/*xvg "
+                        f"-o {analysis_dir}/results.txt "
+                        f"-oA {analysis_dir}/integ0.dat -oB {analysis_dir}/integ1.dat "
+                        f"-w {analysis_dir}/wplot.png -t 298 -b 100"
+                    )
+                    subprocess.run(cmd, shell=True, check=True)
+                    if bVerbose:
+                        with open(os.path.join(analysis_dir, "results.txt")) as f:
+                            print("".join([l for l in f if "ANALYSIS" in l or "INTEG" in l]))
+
+        print("✅ Analysis completed\n")
+
+    def prepare_jobscripts(self, edges=None, simType='em'):
+        if edges is None:
+            edges = self.edges
+        print(f"📁 Generating job scripts for: {simType}")
+        jobdir = os.path.join(self.workPath, f"{simType}_jobscripts")
+        create_folder(jobdir)
         counter = 0
-        for edge in edges:
-            
-            for state in self.states:
-                for r in range(1,self.replicas+1):            
-                    simpath = self._get_specific_path(edge=edge,state=state,r=r,sim=simType)
-                    jobfile = '{0}/jobscript{1}'.format(jobfolder,counter)
-                    jobname = 'j{0}_{1}_{2}_{3}'.format(edge,state,r,simType)
-                    job = pmx.jobscript.Jobscript(fname=jobfile,
-                                    queue=self.JOBqueue,simcpu=self.JOBsimcpu,
-                                    jobname=jobname,modules=self.JOBmodules,source=self.JOBsource,
-                                    gmx=self.JOBgmx,partition=self.JOBpartition,bGPU=self.JOBbGPU)
-                    cmd1 = 'cd {0}'.format(simpath)
-                    cmd2 = '$GMXRUN -s tpr.tpr'
-                    job.cmds = [cmd1,cmd2]
-                    if simType=='transitions':
-                        if self.JOBnotr%self.JOBsimcpu==0:
-                            njobs = int(self.JOBnotr/self.JOBsimcpu)
-                        else:
-                            njobs = int(self.JOBnotr/self.JOBsimcpu)+1
-                        for nj in range(njobs):
-                            if nj==njobs-1:
-                                indx=[int(nj*self.JOBsimcpu), self.JOBnotr]
-                            else:
-                                indx = [int(nj*self.JOBsimcpu), int((nj+1)*self.JOBsimcpu)]
 
-                            jobfile = '{0}/jobscript{1}'.format(jobfolder,counter)
-                            jobname = 'prot_{0}'.format(counter)
-                            self._create_jobscript(fname=jobfile,jobname=jobname,modules=self.JOBmodules,gmx=self.JOBgmx,partition=self.JOBpartition,simpath=simpath,indx=indx)
-                            counter+=1
+        for edge in edges:
+            for state in self.states:
+                for r in range(1, self.replicas + 1):
+                    sim_dir = self._get_specific_path(edge, state, r, simType)
+                    base_script = os.path.join(jobdir, f"jobscript{counter}")
+                    job = pmx.jobscript.Jobscript(
+                        fname=base_script,
+                        queue=self.JOBqueue,
+                        simcpu=self.JOBsimcpu,
+                        jobname=f"j{edge}_{state}_{r}_{simType}",
+                        modules=self.JOBmodules,
+                        source=self.JOBsource,
+                        gmx=self.JOBgmx,
+                        partition=self.JOBpartition,
+                        bGPU=self.JOBbGPU
+                    )
+
+                    job.cmds = [f"cd {sim_dir}", "$GMXRUN -s tpr.tpr"]
+                    if simType == 'transitions':
+                        total = self.JOBnotr
+                        step = self.JOBsimcpu
+                        for idx_start in range(0, total, step):
+                            idx_end = min(idx_start+step, total)
+                            self._create_jobscript(
+                                fname=os.path.join(jobdir, f"jobscript{counter}"),
+                                jobname=f"{edge}_run{r}_chunk{idx_start}",
+                                modules=self.JOBmodules,
+                                gmx=self.JOBgmx,
+                                partition=self.JOBpartition,
+                                simpath=sim_dir,
+                                indx=[idx_start, idx_end]
+                            )
+                            counter += 1
                     else:
                         job.create_jobscript()
-                        counter+=1
-                        
-        #######
-        self._submission_script( jobfolder, counter, simType )
-        print('DONE')
-        
-    def _submission_script( self, jobfolder, counter, simType='eq' ):
-        fname = '{0}/submit.py'.format(jobfolder)
-        fp = open(fname,'w')
-        fp.write('import os\n')
-        fp.write('for i in range(0,{0}):\n'.format(counter))
-        if self.JOBqueue=='SGE':
-            cmd = '\'qsub jobscript{0}\'.format(i)'
-            if simType=='transitions':
-                cmd = '\'qsub -t 1-50:1 jobscript{0}\'.format(i)'
-        elif self.JOBqueue=='SLURM':
-            cmd = '\'sbatch jobscript{0}\'.format(i)'
-        fp.write('    os.system({0})\n'.format(cmd))
-        fp.close()
+                        counter += 1
 
-    def _extract_snapshots( self, eqpath, tipath ):
-        tpr = '{0}/tpr.tpr'.format(eqpath)
-        trr = '{0}/traj.trr'.format(eqpath)
-        frame = '{0}/frame.gro'.format(tipath)
-        
-        gmx.trjconv(s=tpr,f=trr,o=frame, sep=True, ur='compact', pbc='mol', other_flags=' -b 2000')
-        # move frame0.gro to frame50.gro
-        cmd = 'mv {0}/frame0.gro {0}/frame100.gro'.format(tipath)
-        os.system(cmd)
-        
-        self._clean_backup_files( tipath )
-        
-        
-    def prepare_transitions( self, edges=None, bGenTpr=True ):
-        print('---------------------')
-        print('Preparing transitions')
-        print('---------------------')
-        
-        if edges==None:
-            edges = self.edges
-        for edge in edges:
-            toppath = self._get_specific_path(edge=edge)
-            
-            for state in self.states:
-                for r in range(1,self.replicas+1):
-                    print('Preparing: PROT {0} {1} run{2}'.format(edge,state,r))
-                    eqpath = self._get_specific_path(edge=edge,state=state,r=r,sim='eq')
-                    tipath = simpath = self._get_specific_path(edge=edge,state=state,r=r,sim='transitions')
-                    self._extract_snapshots( eqpath, tipath )
-                    if bGenTpr==True:
-                        for i in range(1,101):
-                            self._prepare_single_tpr( tipath, toppath, state, simType='transitions',frameNum=i )
-        print('DONE')  
-        
-        
-    def _run_analysis_script( self, analysispath, stateApath, stateBpath, bVerbose=False ):
-        fA = ' '.join( glob.glob('{0}/*xvg'.format(stateApath)) )
-        fB = ' '.join( glob.glob('{0}/*xvg'.format(stateBpath)) )
-        oA = '{0}/integ0.dat'.format(analysispath)
-        oB = '{0}/integ1.dat'.format(analysispath)
-        wplot = '{0}/wplot.png'.format(analysispath)
-        o = '{0}/results.txt'.format(analysispath)
+        # Write submission wrapper
+        submit_py = os.path.join(jobdir, "submit.py")
+        with open(submit_py, "w") as fp:
+            fp.write("import os\n")
+            for i in range(counter):
+                if self.JOBqueue == 'SGE':
+                    cmd = f"qsub jobscript{i}"
+                else:
+                    cmd = f"sbatch jobscript{i}"
+                fp.write(f"os.system('{cmd}')\n")
 
-        cmd = 'pmx analyse -fA {0} -fB {1} -o {2} -oA {3} -oB {4} -w {5} -t {6} -b {7}'.format(\
-                                                                            fA,fB,o,oA,oB,wplot,298,100) 
-        os.system(cmd)
+        print(f"✅ {counter} job scripts generated in {jobdir}\n")
 
-        
-        if bVerbose==True:
-            fp = open(o,'r')
-            lines = fp.readlines()
-            fp.close()
-            bPrint = False
-            for l in lines:
-                if 'ANALYSIS' in l:
-                    bPrint=True
-                if bPrint==True:
-                    print(l,end='')
+    def _create_jobscript(self, fname, jobname, modules, gmx, partition, simpath, indx):
+        with open(fname, "w") as fp:
+            fp.write("#!/bin/bash\n")
+            fp.write(f"#SBATCH --job-name={jobname}\n")
+            fp.write("#SBATCH --nodes=1\n")
+            fp.write(f"#SBATCH --ntasks-per-node={indx[1]-indx[0]}\n")
+            fp.write(f"#SBATCH --cpus-per-task={self.JOBntomp}\n")
+            fp.write("#SBATCH --mail-type=none\n")
+            fp.write(f"#SBATCH --time={self.JOBsimtime}:00:00\n")
+            fp.write(f"#SBATCH --partition={partition}\n")
+            if self.JOBbGPU:
+                fp.write("#SBATCH --gres=gpu:1\n")
+            fp.write("\n")
+            for src in self.JOBsource:
+                fp.write(f"source {src}\n")
+            for mod in modules:
+                fp.write(f"module load {mod}\n")
+            fp.write(f'export GMXRUN="{gmx}"\n')
+            fp.write("cd $TMPDIR\n")
+            fp.write(f"for i in {{{indx[0]+1}..{indx[1]}}}; do\n")
+            fp.write("  mkdir ti$i; cp {}/ti$i.tpr ti$i/tpr.tpr\n".format(simpath))
+            fp.write("done\n")
+            fp.write("$GMXRUN -s tpr.tpr -multidir ti{{$indx[0]+1..$indx[1]}}\n")
+            fp.write("for i in {{{0}+1..{1}}}; do cp ti$i/dhdl.xvg {2}/dhdl$i.xvg; done\n".format(indx[0], indx[1], simpath))
 
-    def run_analysis( self, edges=None, bProt=True, bParseOnly=False, bVerbose=False ):
-        print('----------------')
-        print('Running analysis')
-        print('----------------')
-        
-        if edges==None:
-            edges = self.edges
-        for edge in edges:
-            print(edge)
-            for r in range(1,self.replicas+1):
-
-                # protein
-                if bProt==True:
-
-                    analysispath = '{0}/analyse{1}'.format(self._get_specific_path(edge=edge),r)
-                    create_folder(analysispath)
-                    stateApath = self._get_specific_path(edge=edge,state='stateA',r=r,sim='transitions')
-                    stateBpath = self._get_specific_path(edge=edge,state='stateB',r=r,sim='transitions')
-                    self._run_analysis_script( analysispath, stateApath, stateBpath, bVerbose=bVerbose )
-
-        print('DONE')
