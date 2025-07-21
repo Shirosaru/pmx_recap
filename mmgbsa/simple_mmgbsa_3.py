@@ -4,8 +4,8 @@ import shutil
 
 # Directories
 BASE_DIR = "/home2/mmGBSA"
-WT_DIR = os.path.join(BASE_DIR, "WT_run")
-MT_DIR = os.path.join(BASE_DIR, "MT_run")
+WT_DIR = os.path.join(BASE_DIR, "WT_run_auto")
+MT_DIR = os.path.join(BASE_DIR, "MT_run_auto")
 MDP_DIR = os.path.join(BASE_DIR, "mdp")
 
 GROMACS = "gmx"         # Or full path to gmx executable
@@ -366,7 +366,7 @@ if __name__ == "__main__":
 
     # Create the index file using the PROTEIN-ONLY TPR
     # This is crucial for the index file atom numbers to align with protein_only.tpr/xtc
-    create_chain_index_by_residues(
+    '''create_chain_index_by_residues(
         tpr_file_path=tpr_for_gmxmmpbsa_cs, # Use protein_only.tpr for make_ndx
         ndx_file_path=ndx,
         chainA_range=(1, 180), # These ranges are RESIDUE numbers, which are absolute in the protein.
@@ -377,6 +377,8 @@ if __name__ == "__main__":
     
 
     '''
+
+    #The auto chain annotation new script from here
     model_pdb_path = os.path.join(workdir, "model.pdb")
     chain_residue_ranges = get_chain_residue_ranges(model_pdb_path)
 
@@ -391,7 +393,7 @@ if __name__ == "__main__":
         chainB_range=chain_residue_ranges.get('B', (1, 1)),
         cwd=workdir
     )
-    '''
+    
 
     # Call gmx_MMPBSA with the corrected protein-only files
     run_gmx_mmpbsa(mmpbsa_input,
