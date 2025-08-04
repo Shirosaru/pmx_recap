@@ -2,9 +2,9 @@ import os
 import subprocess
 import shutil
 from collections import defaultdict
-import re # Added for more robust group number parsing if needed, but simplified below
+import re
 
-# --- Configuration (same as before) ---
+# --- Configuration ---
 BASE_DIR = "/home2/mmGBSA/test2"
 WT_SOURCE_DIR = os.path.join(BASE_DIR, "WT")
 MT_SOURCE_DIR = os.path.join(BASE_DIR, "Mut")
@@ -89,33 +89,26 @@ def relabel_and_renumber_pdb_chains(input_pdb, output_pdb):
                 original_resid = int(line[22:26])
 
                 if is_processing_chain_a:
-                    # Heuristic for chain break:
-                    # If we've processed some residues for chain A, AND
-                    # current residue is 1 (or significantly lower than previous) AND
-                    # the original chain ID has changed (e.g., from A to B) OR
-                    # the residue number has reset (1) while previous was high.
                     if (len(all_resids_A) > 0 and original_resid == 1 and
                         (original_chain_id != last_original_chain_id or original_resid < last_original_resid)):
                         
-                        output_lines.append("TER\n") # Insert TER before the new chain
+                        output_lines.append("TER\n")
                         print(f"[DEBUG] Detected chain transition. Appending TER. Old Chain: {last_original_chain_id} Resid: {last_original_resid}. New Chain: {original_chain_id} Resid: {original_resid}")
                         is_processing_chain_a = False
                         
-                        # Calculate new_resid for the first residue of chain B
-                        new_resid = (chain_a_max_resid + 1) # Chain B starts after Chain A's last original residue
+                        new_resid = (chain_a_max_resid + 1)
                         all_resids_B.add(new_resid)
                         newline = line[:21] + chain_b_assigned_id + f"{new_resid:4d}" + line[26:]
                         output_lines.append(newline)
 
-                    else: # Still processing Chain A
+                    else:
                         all_resids_A.add(original_resid)
-                        chain_a_max_resid = max(chain_a_max_resid, original_resid) # Max original resid for chain A
+                        chain_a_max_resid = max(chain_a_max_resid, original_resid)
                         newline = line[:21] + chain_a_assigned_id + line[22:]
                         output_lines.append(newline)
 
-                else: # Processing Chain B
-                    # Renumber Chain B residues sequentially after Chain A's last original residue
-                    new_resid = chain_a_max_resid + (original_resid - 1) + 1 # (original_resid - 1) makes it 0-indexed offset
+                else:
+                    new_resid = chain_a_max_resid + (original_resid - 1) + 1
                     all_resids_B.add(new_resid)
                     newline = line[:21] + chain_b_assigned_id + f"{new_resid:4d}" + line[26:]
                     output_lines.append(newline)
@@ -123,9 +116,8 @@ def relabel_and_renumber_pdb_chains(input_pdb, output_pdb):
                 last_original_chain_id = original_chain_id
                 last_original_resid = original_resid
             else:
-                output_lines.append(line) # Keep non-ATOM/HETATM lines
+                output_lines.append(line)
 
-    # Add a final TER card at the end of the file if needed
     if output_lines and output_lines[-1].strip().startswith(("ATOM", "HETATM")):
         output_lines.append("TER\n")
         print("[DEBUG] Appended final TER card.")
@@ -136,10 +128,7 @@ def relabel_and_renumber_pdb_chains(input_pdb, output_pdb):
     actual_chain_a_length = len(all_resids_A)
     actual_chain_b_length = len(all_resids_B)
 
-    # Fallback/sanity check if only one chain was detected
     if actual_chain_a_length > 0 and actual_chain_b_length == 0 and not is_processing_chain_a:
-        # If we switched to B but B ended up empty, means it was likely a single chain.
-        # Recalculate based on 'A' and if 'B' was truly not found, set its length to 0.
         print("[WARNING] Chain B appeared to be intended but was empty. Re-evaluating chain lengths.")
         all_resids_in_output = set()
         for line in output_lines:
@@ -151,7 +140,7 @@ def relabel_and_renumber_pdb_chains(input_pdb, output_pdb):
                 elif current_chain == chain_b_assigned_id:
                     all_resids_B.add(current_resid)
         actual_chain_a_length = len(all_resids_A)
-        actual_chain_b_length = len(all_resids_B) # This might still be 0, which is correct
+        actual_chain_b_length = len(all_resids_B)
         
     print(f"[INFO] Chains relabeled and renumbered to {output_pdb}. Chain A length: {actual_chain_a_length}, Chain B length: {actual_chain_b_length}.")
     
@@ -202,11 +191,12 @@ def create_protein_only_topology(original_top_file, output_top_file):
 
     print(f"[INFO] {output_top_file} created with only protein definitions.")
 
-# prepare_system function (same as before)
-def prepare_system(initial_pdb_source_path, workdir):
+# prepare_system function (MODIFIED to copy and rename input PDB)
+def prepare_system(source_pdb_path, workdir):
     """
     Prepare the molecular system for MM/GBSA.
-    Corrects chain IDs and renumbers residues in the initial PDB, then runs full GROMACS setup,
+    Copies the source PDB into the working directory as 'model.pdb',
+    corrects chain IDs and renumbers residues, then runs full GROMACS setup,
     and prepares protein-only files and index for gmx_MMPBSA.
     """
     print(f"\n--- [STAGE] Preparing system in {workdir} ---")
@@ -216,19 +206,29 @@ def prepare_system(initial_pdb_source_path, workdir):
         shutil.rmtree(workdir)
     os.makedirs(workdir, exist_ok=True)
     
-    if not os.path.exists(initial_pdb_source_path):
-        raise FileNotFoundError(f"Source PDB not found at: {initial_pdb_source_path}")
+    if not os.path.exists(source_pdb_path):
+        raise FileNotFoundError(f"Source PDB not found at: {source_pdb_path}")
 
-    model_pdb = os.path.join(workdir, "model.pdb")
+    # --- MODIFICATION START ---
+    # Copy the specific input PDB to 'model.pdb' in the working directory
+    model_pdb_in_workdir = os.path.join(workdir, "model.pdb")
+    print(f"[INFO] Copying {source_pdb_path} to {model_pdb_in_workdir}")
+    shutil.copy(source_pdb_path, model_pdb_in_workdir)
+    # --- MODIFICATION END ---
     
-    temp_pdb_for_relabel = os.path.join(workdir, "input_for_relabel.pdb")
-    shutil.copy(initial_pdb_source_path, temp_pdb_for_relabel)
-
+    # Now, relabel_and_renumber_pdb_chains will operate on the 'model.pdb' just copied
+    processed_model_pdb = os.path.join(workdir, "processed_model.pdb") # Intermediate step for relabeling output
+    
     actual_chain_a_length, actual_chain_b_length = relabel_and_renumber_pdb_chains(
-        temp_pdb_for_relabel, model_pdb
+        model_pdb_in_workdir, processed_model_pdb # Use the copied model.pdb as input
     )
-        
-    run_cmd(f"{GROMACS} pdb2gmx -f {os.path.basename(model_pdb)} -o processed.gro -water spce -ff amber99sb-ildn", cwd=workdir)
+    # Overwrite the original model.pdb with the processed one
+    shutil.move(processed_model_pdb, model_pdb_in_workdir)
+    print(f"[INFO] Processed PDB moved to {model_pdb_in_workdir} for GROMACS input.")
+
+    # === Full system setup ===
+    # All GROMACS commands will now use 'model.pdb' as the input
+    run_cmd(f"{GROMACS} pdb2gmx -f {os.path.basename(model_pdb_in_workdir)} -o processed.gro -water spce -ff amber99sb-ildn", cwd=workdir)
     run_cmd(f"{GROMACS} editconf -f processed.gro -o boxed.gro -c -d 1.0 -bt cubic", cwd=workdir)
     run_cmd(f"{GROMACS} solvate -cp boxed.gro -cs spc216.gro -o solvated.gro -p topol.top", cwd=workdir)
     run_cmd(f"{GROMACS} grompp -f {MDP_DIR}/ions.mdp -c solvated.gro -p topol.top -o ions.tpr", cwd=workdir)
@@ -300,7 +300,7 @@ def get_chain_residue_ranges(pdb_path):
 
     return residue_ranges
 
-# --- REVISED create_chain_index_by_residues (Simplified and Corrected) ---
+# REVISED create_chain_index_by_residues (Same as last successful version)
 def create_chain_index_by_residues(tpr_file_path, ndx_file_path, chainA_range, chainB_range, cwd):
     """
     Creates an index file (.ndx) with groups for Chain A and Chain B
@@ -311,11 +311,6 @@ def create_chain_index_by_residues(tpr_file_path, ndx_file_path, chainA_range, c
 
     cmd = [GROMACS, 'make_ndx', '-f', os.path.basename(tpr_file_path), '-o', os.path.basename(ndx_file_path)]
     
-    # We need to determine the default group numbers GROMACS assigns after `r` command
-    # and then use `name` on those. This is slightly heuristic but usually reliable for 2 new groups.
-    # We will simulate the interactive session to get the group numbers.
-    
-    # First, run make_ndx and just print groups to find existing highest number
     temp_check_ndx = os.path.join(cwd, "temp_check.ndx")
     p_check = subprocess.run([GROMACS, 'make_ndx', '-f', os.path.basename(tpr_file_path), '-o', os.path.basename(temp_check_ndx)], 
                              input="q\n", capture_output=True, text=True, cwd=cwd)
@@ -330,20 +325,19 @@ def create_chain_index_by_residues(tpr_file_path, ndx_file_path, chainA_range, c
             except ValueError:
                 pass
     
-    os.remove(temp_check_ndx) # Clean up temp file
+    os.remove(temp_check_ndx)
 
-    # Calculate the expected new group numbers
     chain_a_group_num = highest_default_group_num + 1
     chain_b_group_num = highest_default_group_num + 2
 
     print(f"[DEBUG] Expected Chain_A group number: {chain_a_group_num}, Chain_B group number: {chain_b_group_num}")
 
     commands = [
-        f"r {chainA_range[0]}-{chainA_range[1]}", # Creates a new group
-        f"r {chainB_range[0]}-{chainB_range[1]}", # Creates another new group
-        f"name {chain_a_group_num} Chain_A", # Renames the first new group
-        f"name {chain_b_group_num} Chain_B", # Renames the second new group
-        "q" # Save and quit
+        f"r {chainA_range[0]}-{chainA_range[1]}",
+        f"r {chainB_range[0]}-{chainB_range[1]}",
+        f"name {chain_a_group_num} Chain_A",
+        f"name {chain_b_group_num} Chain_B",
+        "q"
     ]
     input_str = "\n".join(commands) + "\n"
 
@@ -382,13 +376,14 @@ def run_gmx_mmpbsa(mmpbsa_in, complex_tpr_file, xtc_file, topol_file, ndx_file):
         print(result.stdout)
 
 
-# Main Execution Block (UPDATED with your configuration paths)
+# Main Execution Block (UPDATED with specific PDB file names)
+# Main Execution Block
 if __name__ == "__main__":
     
     # Ensure MDP_DIR exists
     os.makedirs(MDP_DIR, exist_ok=True)
     # Create dummy .mdp files if they don't exist
-    for mdp_file in ["ions.mdp", "minim.mdp", "nvt.mdp", "npt.mdp", "md.mdp", "empty.mdp"]: # Added empty.mdp here
+    for mdp_file in ["ions.mdp", "minim.mdp", "nvt.mdp", "npt.mdp", "md.mdp", "empty.mdp"]:
         path = os.path.join(MDP_DIR, mdp_file)
         if not os.path.exists(path):
             print(f"[INFO] Creating dummy {mdp_file} in {MDP_DIR}. Please replace with actual MDPs.")
@@ -399,70 +394,79 @@ if __name__ == "__main__":
                     f.write(f"; Dummy {mdp_file}\nintegrator = md\nnsteps = 1000 ; Adjust as needed for actual simulation\n")
 
     # --- WT System Processing ---
-    wt_initial_pdb_source = os.path.join(WT_SOURCE_DIR, "model.pdb") # Assuming model.pdb is directly in WT_SOURCE_DIR
+    wt_initial_pdb_source = os.path.join(WT_SOURCE_DIR, "WTModel_0.pdb") 
     wt_workdir = WT_RUN_DIR
 
-    wt_chain_a_length, wt_chain_b_length = prepare_system(wt_initial_pdb_source, wt_workdir)
+    try:
+        wt_chain_a_length, wt_chain_b_length = prepare_system(wt_initial_pdb_source, wt_workdir)
+        
+        wt_protein_only_pdb_path = os.path.join(wt_workdir, "protein_only.pdb")
+        wt_chain_residue_ranges = get_chain_residue_ranges(wt_protein_only_pdb_path)
+        
+        print(f"[INFO] WT Detected residue ranges from protein_only.pdb: {wt_chain_residue_ranges}")
 
-    wt_protein_only_pdb_path = os.path.join(wt_workdir, "protein_only.pdb")
-    wt_chain_residue_ranges = get_chain_residue_ranges(wt_protein_only_pdb_path)
-    
-    print(f"[INFO] WT Detected residue ranges from protein_only.pdb: {wt_chain_residue_ranges}")
+        wt_tpr_for_gmxmmpbsa_cs = os.path.join(wt_workdir, "protein_only.tpr")
+        wt_xtc_for_gmxmmpbsa_ct = os.path.join(wt_workdir, "protein_only.xtc")
+        wt_protein_only_topol_for_mmpbsa = os.path.join(wt_workdir, "protein_only.top")
+        wt_ndx = os.path.join(wt_workdir, "index_chain.ndx")
+        wt_mmpbsa_input = os.path.join(wt_workdir, "mmpbsa.in")
 
-    wt_tpr_for_gmxmmpbsa_cs = os.path.join(wt_workdir, "protein_only.tpr")
-    wt_xtc_for_gmxmmpbsa_ct = os.path.join(wt_workdir, "protein_only.xtc")
-    wt_protein_only_topol_for_mmpbsa = os.path.join(wt_workdir, "protein_only.top")
-    wt_ndx = os.path.join(wt_workdir, "index_chain.ndx")
-    wt_mmpbsa_input = os.path.join(wt_workdir, "mmpbsa.in")
+        create_chain_index_by_residues(
+            tpr_file_path=wt_tpr_for_gmxmmpbsa_cs,
+            ndx_file_path=wt_ndx,
+            chainA_range=wt_chain_residue_ranges.get('A', (1,1)),
+            chainB_range=wt_chain_residue_ranges.get('B', (1,1)),
+            cwd=wt_workdir
+        )
 
-    create_chain_index_by_residues(
-        tpr_file_path=wt_tpr_for_gmxmmpbsa_cs,
-        ndx_file_path=wt_ndx,
-        chainA_range=wt_chain_residue_ranges.get('A', (1,1)),
-        chainB_range=wt_chain_residue_ranges.get('B', (1,1)),
-        cwd=wt_workdir
-    )
+        run_gmx_mmpbsa(wt_mmpbsa_input,
+                       wt_tpr_for_gmxmmpbsa_cs,
+                       wt_xtc_for_gmxmmpbsa_ct,
+                       wt_protein_only_topol_for_mmpbsa,
+                       wt_ndx)
 
-    run_gmx_mmpbsa(wt_mmpbsa_input,
-                   wt_tpr_for_gmxmmpbsa_cs,
-                   wt_xtc_for_gmxmmpbsa_ct,
-                   wt_protein_only_topol_for_mmpbsa,
-                   wt_ndx)
-
-    print(f"\n--- [STAGE] WT MM/GBSA calculation complete ---")
+        print(f"\n--- [STAGE] WT MM/GBSA calculation complete ---")
+    except Exception as e:
+        print(f"\n[WARNING] An error occurred during the WT calculation: {e}")
+        print("[WARNING] The script will now proceed with the MT calculation.")
 
 
     # --- MT System Processing (similar structure) ---
-    mt_initial_pdb_source = os.path.join(MT_SOURCE_DIR, "model.pdb")
+    mt_initial_pdb_source = os.path.join(MT_SOURCE_DIR, "MutModel_0.pdb") 
     mt_workdir = MT_RUN_DIR
-
-    mt_chain_a_length, mt_chain_b_length = prepare_system(mt_initial_pdb_source, mt_workdir)
-
-    mt_protein_only_pdb_path = os.path.join(mt_workdir, "protein_only.pdb")
-    mt_chain_residue_ranges = get_chain_residue_ranges(mt_protein_only_pdb_path)
     
-    print(f"[INFO] MT Detected residue ranges from protein_only.pdb: {mt_chain_residue_ranges}")
+    try:
+        mt_chain_a_length, mt_chain_b_length = prepare_system(mt_initial_pdb_source, mt_workdir)
 
-    mt_tpr_for_gmxmmpbsa_cs = os.path.join(mt_workdir, "protein_only.tpr")
-    mt_xtc_for_gmxmmpbsa_ct = os.path.join(mt_workdir, "protein_only.xtc")
-    mt_protein_only_topol_for_mmpbsa = os.path.join(mt_workdir, "protein_only.top")
-    mt_ndx = os.path.join(mt_workdir, "index_chain.ndx")
-    mt_mmpbsa_input = os.path.join(mt_workdir, "mmpbsa.in")
+        mt_protein_only_pdb_path = os.path.join(mt_workdir, "protein_only.pdb")
+        mt_chain_residue_ranges = get_chain_residue_ranges(mt_protein_only_pdb_path)
+        
+        print(f"[INFO] MT Detected residue ranges from protein_only.pdb: {mt_chain_residue_ranges}")
 
-    create_chain_index_by_residues(
-        tpr_file_path=mt_tpr_for_gmxmmpbsa_cs,
-        ndx_file_path=mt_ndx,
-        chainA_range=mt_chain_residue_ranges.get('A', (1,1)),
-        chainB_range=mt_chain_residue_ranges.get('B', (1,1)),
-        cwd=mt_workdir
-    )
+        mt_tpr_for_gmxmmpbsa_cs = os.path.join(mt_workdir, "protein_only.tpr")
+        mt_xtc_for_gmxmmpbsa_ct = os.path.join(mt_workdir, "protein_only.xtc")
+        mt_protein_only_topol_for_mmpbsa = os.path.join(mt_workdir, "protein_only.top")
+        mt_ndx = os.path.join(mt_workdir, "index_chain.ndx")
+        mt_mmpbsa_input = os.path.join(mt_workdir, "mmpbsa.in")
 
-    run_gmx_mmpbsa(mt_mmpbsa_input,
-                   mt_tpr_for_gmxmmpbsa_cs,
-                   mt_xtc_for_gmxmmpbsa_ct,
-                   mt_protein_only_topol_for_mmpbsa,
-                   mt_ndx)
+        create_chain_index_by_residues(
+            tpr_file_path=mt_tpr_for_gmxmmpbsa_cs,
+            ndx_file_path=mt_ndx,
+            chainA_range=mt_chain_residue_ranges.get('A', (1,1)),
+            chainB_range=mt_chain_residue_ranges.get('B', (1,1)),
+            cwd=mt_workdir
+        )
 
-    print(f"\n--- [STAGE] MT MM/GBSA calculation complete ---")
+        run_gmx_mmpbsa(mt_mmpbsa_input,
+                       mt_tpr_for_gmxmmpbsa_cs,
+                       mt_xtc_for_gmxmmpbsa_ct,
+                       mt_protein_only_topol_for_mmpbsa,
+                       mt_ndx)
+
+        print(f"\n--- [STAGE] MT MM/GBSA calculation complete ---")
+    except Exception as e:
+        print(f"\n[WARNING] An error occurred during the MT calculation: {e}")
+        print("[WARNING] The script has terminated after this error.")
+
 
     print("\n--- All calculations finished. Review gmx_MMPBSA.log files for results. ---")
