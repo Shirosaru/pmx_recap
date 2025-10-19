@@ -4,6 +4,9 @@ import shutil
 from collections import defaultdict
 import re
 
+#Before running activate gmxMMPBSA and then need to source /opt/gromacs/bin/GMXRC for GPU runs
+
+
 # --- Configuration ---
 BASE_DIR = "/home2/mmGBSA/test5_protease"
 WT_SOURCE_DIR = os.path.join(BASE_DIR, "WT")
