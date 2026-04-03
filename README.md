@@ -39,6 +39,11 @@ cd openmm/
 python OpenMM.py
 ```
 
+Compare job security cultures (US at-will vs Japan lifetime employment):
+```bash
+python compare_job_security.py
+```
+
 ## License
 
 See LICENSE file for details.
